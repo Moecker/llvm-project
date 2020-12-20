@@ -41,10 +41,6 @@
 namespace llvm {
 namespace libc_benchmarks {
 
-// Makes sure the binary was compiled in release mode and that frequency
-// governor is set on performance.
-void checkRequirements();
-
 using Duration = std::chrono::duration<double>;
 
 enum class BenchmarkLog {
@@ -69,7 +65,7 @@ struct BenchmarkOptions {
   uint32_t MinSamples = 4;
   // The maximum number of samples.
   uint32_t MaxSamples = 1000;
-  // The benchmark will stop is the relative difference between the current and
+  // The benchmark will stop if the relative difference between the current and
   // the last estimation is less than epsilon. This is 1% by default.
   double Epsilon = 0.01;
   // The number of iterations grows exponentially between each sample.
@@ -317,6 +313,10 @@ template <typename T, size_t N>
 CircularArrayRef<T> cycle(const std::array<T, N> &Container, size_t Size) {
   return {llvm::ArrayRef<T>(Container.cbegin(), Container.cend()), Size};
 }
+
+// Makes sure the binary was compiled in release mode and that frequency
+// governor is set on performance.
+void checkRequirements();
 
 } // namespace libc_benchmarks
 } // namespace llvm

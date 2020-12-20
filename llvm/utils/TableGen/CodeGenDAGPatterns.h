@@ -14,7 +14,6 @@
 #ifndef LLVM_UTILS_TABLEGEN_CODEGENDAGPATTERNS_H
 #define LLVM_UTILS_TABLEGEN_CODEGENDAGPATTERNS_H
 
-#include "CodeGenHwModes.h"
 #include "CodeGenIntrinsics.h"
 #include "CodeGenTarget.h"
 #include "SDNodeProperties.h"
@@ -42,7 +41,6 @@ class SDNodeInfo;
 class TreePattern;
 class TreePatternNode;
 class CodeGenDAGPatterns;
-class ComplexPattern;
 
 /// Shared pointer for TreePatternNode.
 using TreePatternNodePtr = std::shared_ptr<TreePatternNode>;
@@ -437,8 +435,6 @@ public:
 
   unsigned getScope() const { return Scope; }
   const std::string &getIdentifier() const { return Identifier; }
-
-  std::string getFullName() const;
 
   bool operator==(const ScopedName &o) const;
   bool operator!=(const ScopedName &o) const;

@@ -41,6 +41,7 @@ struct ExprDependenceScope {
     TypeInstantiation = Type | Instantiation,
     ValueInstantiation = Value | Instantiation,
     TypeValueInstantiation = Type | Value | Instantiation,
+    ErrorDependent = Error | ValueInstantiation,
 
     LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/Error)
   };
@@ -253,6 +254,12 @@ inline TypeDependence toTypeDependence(TemplateNameDependence D) {
 }
 inline TypeDependence toTypeDependence(TemplateArgumentDependence D) {
   return Dependence(D).type();
+}
+/// Compute the dependence of a type that depends on the type of an expression,
+/// given the dependence of that expression and of its type.
+inline TypeDependence typeToTypeDependence(ExprDependence ED, TypeDependence TD) {
+  return Dependence(ED & ~ExprDependence::Value).type() |
+         (TD & TypeDependence::VariablyModified);
 }
 
 inline NestedNameSpecifierDependence

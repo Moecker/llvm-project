@@ -2,6 +2,9 @@
 /// Perform several driver tests for OpenMP offloading
 ///
 
+// https://PR46644
+// XFAIL: arm64-apple
+
 // REQUIRES: clang-driver
 // REQUIRES: x86-registered-target
 // REQUIRES: powerpc-registered-target
@@ -241,7 +244,7 @@
 
 // HAS_DEBUG-NOT: warning: debug
 // HAS_DEBUG: "-triple" "nvptx64-nvidia-cuda"
-// HAS_DEBUG-SAME: "-debug-info-kind={{constructor|line-tables-only}}"
+// HAS_DEBUG-SAME: "-debug-info-kind={{limited|line-tables-only}}"
 // HAS_DEBUG-SAME: "-dwarf-version=2"
 // HAS_DEBUG-SAME: "-fopenmp-is-device"
 // HAS_DEBUG: ptxas

@@ -662,7 +662,8 @@ public:
          const DataLayout &DL)
       : F(F), DT(DT), TLI(TLI), AA(AA), MSSA(MSSA), AC(AC), DL(DL),
         PredInfo(std::make_unique<PredicateInfo>(F, *DT, *AC)),
-        SQ(DL, TLI, DT, AC, /*CtxI=*/nullptr, /*UseInstrInfo=*/false) {}
+        SQ(DL, TLI, DT, AC, /*CtxI=*/nullptr, /*UseInstrInfo=*/false,
+           /*CanUseUndef=*/false) {}
 
   bool runGVN();
 
@@ -800,9 +801,6 @@ private:
   Value *findPHIOfOpsLeader(const Expression *, const Instruction *,
                             const BasicBlock *) const;
 
-  // New instruction creation.
-  void handleNewInstruction(Instruction *) {}
-
   // Various instruction touch utilities
   template <typename Map, typename KeyType, typename Func>
   void for_each_found(Map &, const KeyType &, Func);
@@ -834,7 +832,6 @@ private:
   BasicBlock *getBlockForValue(Value *V) const;
   void deleteExpression(const Expression *E) const;
   MemoryUseOrDef *getMemoryAccess(const Instruction *) const;
-  MemoryAccess *getDefiningAccess(const MemoryAccess *) const;
   MemoryPhi *getMemoryAccess(const BasicBlock *) const;
   template <class T, class Range> T *getMinDFSOfRange(const Range &) const;
 
@@ -1253,6 +1250,7 @@ const UnknownExpression *NewGVN::createUnknownExpression(Instruction *I) const {
 const CallExpression *
 NewGVN::createCallExpression(CallInst *CI, const MemoryAccess *MA) const {
   // FIXME: Add operand bundles for calls.
+  // FIXME: Allow commutative matching for intrinsics.
   auto *E =
       new (ExpressionAllocator) CallExpression(CI->getNumOperands(), CI, MA);
   setBasicExpressionInfo(CI, E);

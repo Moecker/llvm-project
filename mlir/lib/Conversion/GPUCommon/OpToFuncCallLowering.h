@@ -29,16 +29,15 @@ namespace mlir {
 /// will be transformed into
 ///   llvm.call @__nv_expf(%arg_f32) : (!llvm.float) -> !llvm.float
 template <typename SourceOp>
-struct OpToFuncCallLowering : public ConvertToLLVMPattern {
+struct OpToFuncCallLowering : public ConvertOpToLLVMPattern<SourceOp> {
 public:
   explicit OpToFuncCallLowering(LLVMTypeConverter &lowering_, StringRef f32Func,
                                 StringRef f64Func)
-      : ConvertToLLVMPattern(SourceOp::getOperationName(),
-                             lowering_.getDialect()->getContext(), lowering_),
-        f32Func(f32Func), f64Func(f64Func) {}
+      : ConvertOpToLLVMPattern<SourceOp>(lowering_), f32Func(f32Func),
+        f64Func(f64Func) {}
 
   LogicalResult
-  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+  matchAndRewrite(SourceOp op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
     using LLVM::LLVMFuncOp;
     using LLVM::LLVMType;
@@ -85,7 +84,7 @@ private:
       return operand;
 
     return rewriter.create<LLVM::FPExtOp>(
-        operand.getLoc(), LLVM::LLVMType::getFloatTy(&type.getDialect()),
+        operand.getLoc(), LLVM::LLVMType::getFloatTy(rewriter.getContext()),
         operand);
   }
 

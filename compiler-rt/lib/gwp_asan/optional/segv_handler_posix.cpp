@@ -1,4 +1,4 @@
-//===-- crash_handler_posix.cpp ---------------------------------*- C++ -*-===//
+//===-- segv_handler_posix.cpp ----------------------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -144,7 +144,7 @@ void installSignalHandlers(gwp_asan::GuardedPoolAllocator *GPA, Printf_t Printf,
   PrintBacktraceForSignalHandler = PrintBacktrace;
   BacktraceForSignalHandler = SegvBacktrace;
 
-  struct sigaction Action;
+  struct sigaction Action = {};
   Action.sa_sigaction = sigSegvHandler;
   Action.sa_flags = SA_SIGINFO;
   sigaction(SIGSEGV, &Action, &PreviousHandler);

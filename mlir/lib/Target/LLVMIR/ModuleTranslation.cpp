@@ -17,11 +17,14 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Attributes.h"
-#include "mlir/IR/Module.h"
-#include "mlir/IR/StandardTypes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/RegionGraphTraits.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Target/LLVMIR/TypeTranslation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/BasicBlock.h"
@@ -29,7 +32,9 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -139,7 +144,7 @@ llvm::Constant *ModuleTranslation::getLLVMConstant(llvm::Type *llvmType,
       return nullptr;
     if (llvmType->isVectorTy())
       return llvm::ConstantVector::getSplat(
-          llvm::ElementCount(numElements, /*Scalable=*/false), child);
+          llvm::ElementCount::get(numElements, /*Scalable=*/false), child);
     if (llvmType->isArrayTy()) {
       auto *arrayType = llvm::ArrayType::get(elementType, numElements);
       SmallVector<llvm::Constant *, 8> constants(numElements, child);
@@ -300,9 +305,8 @@ ModuleTranslation::ModuleTranslation(Operation *module,
     : mlirModule(module), llvmModule(std::move(llvmModule)),
       debugTranslation(
           std::make_unique<DebugTranslation>(module, *this->llvmModule)),
-      ompDialect(
-          module->getContext()->getRegisteredDialect<omp::OpenMPDialect>()),
-      llvmDialect(module->getContext()->getRegisteredDialect<LLVMDialect>()) {
+      ompDialect(module->getContext()->getLoadedDialect("omp")),
+      typeTranslator(this->llvmModule->getContext()) {
   assert(satisfiesLLVMModule(mlirModule) &&
          "mlirModule should honor LLVM's module semantics.");
 }
@@ -319,26 +323,40 @@ static Value getPHISourceValue(Block *current, Block *pred,
   if (isa<LLVM::BrOp>(terminator))
     return terminator.getOperand(index);
 
-  // For conditional branches, we need to check if the current block is reached
-  // through the "true" or the "false" branch and take the relevant operands.
-  auto condBranchOp = dyn_cast<LLVM::CondBrOp>(terminator);
-  assert(condBranchOp &&
-         "only branch operations can be terminators of a block that "
-         "has successors");
-  assert((condBranchOp.getSuccessor(0) != condBranchOp.getSuccessor(1)) &&
-         "successors with arguments in LLVM conditional branches must be "
-         "different blocks");
+  SuccessorRange successors = terminator.getSuccessors();
+  assert(std::adjacent_find(successors.begin(), successors.end()) ==
+             successors.end() &&
+         "successors with arguments in LLVM branches must be different blocks");
+  (void)successors;
 
-  return condBranchOp.getSuccessor(0) == current
-             ? condBranchOp.trueDestOperands()[index]
-             : condBranchOp.falseDestOperands()[index];
+  // For instructions that branch based on a condition value, we need to take
+  // the operands for the branch that was taken.
+  if (auto condBranchOp = dyn_cast<LLVM::CondBrOp>(terminator)) {
+    // For conditional branches, we take the operands from either the "true" or
+    // the "false" branch.
+    return condBranchOp.getSuccessor(0) == current
+               ? condBranchOp.trueDestOperands()[index]
+               : condBranchOp.falseDestOperands()[index];
+  } else if (auto switchOp = dyn_cast<LLVM::SwitchOp>(terminator)) {
+    // For switches, we take the operands from either the default case, or from
+    // the case branch that was taken.
+    if (switchOp.defaultDestination() == current)
+      return switchOp.defaultOperands()[index];
+    for (auto i : llvm::enumerate(switchOp.caseDestinations()))
+      if (i.value() == current)
+        return switchOp.getCaseOperands(i.index())[index];
+  }
+
+  llvm_unreachable("only branch or switch operations can be terminators of a "
+                   "block that has successors");
 }
 
 /// Connect the PHI nodes to the results of preceding blocks.
 template <typename T>
-static void
-connectPHINodes(T &func, const DenseMap<Value, llvm::Value *> &valueMapping,
-                const DenseMap<Block *, llvm::BasicBlock *> &blockMapping) {
+static void connectPHINodes(
+    T &func, const DenseMap<Value, llvm::Value *> &valueMapping,
+    const DenseMap<Block *, llvm::BasicBlock *> &blockMapping,
+    const DenseMap<Operation *, llvm::Instruction *> &branchMapping) {
   // Skip the first block, it cannot be branched to and its arguments correspond
   // to the arguments of the LLVM function.
   for (auto it = std::next(func.begin()), eit = func.end(); it != eit; ++it) {
@@ -351,33 +369,33 @@ connectPHINodes(T &func, const DenseMap<Value, llvm::Value *> &valueMapping,
       auto &phiNode = numberedPhiNode.value();
       unsigned index = numberedPhiNode.index();
       for (auto *pred : bb->getPredecessors()) {
+        // Find the LLVM IR block that contains the converted terminator
+        // instruction and use it in the PHI node. Note that this block is not
+        // necessarily the same as blockMapping.lookup(pred), some operations
+        // (in particular, OpenMP operations using OpenMPIRBuilder) may have
+        // split the blocks.
+        llvm::Instruction *terminator =
+            branchMapping.lookup(pred->getTerminator());
+        assert(terminator && "missing the mapping for a terminator");
         phiNode.addIncoming(valueMapping.lookup(getPHISourceValue(
                                 bb, pred, numArguments, index)),
-                            blockMapping.lookup(pred));
+                            terminator->getParent());
       }
     }
-  }
-}
-
-// TODO: implement an iterative version
-static void topologicalSortImpl(llvm::SetVector<Block *> &blocks, Block *b) {
-  blocks.insert(b);
-  for (Block *bb : b->getSuccessors()) {
-    if (blocks.count(bb) == 0)
-      topologicalSortImpl(blocks, bb);
   }
 }
 
 /// Sort function blocks topologically.
 template <typename T>
 static llvm::SetVector<Block *> topologicalSort(T &f) {
-  // For each blocks that has not been visited yet (i.e. that has no
-  // predecessors), add it to the list and traverse its successors in DFS
-  // preorder.
+  // For each block that has not been visited yet (i.e. that has no
+  // predecessors), add it to the list as well as its successors.
   llvm::SetVector<Block *> blocks;
   for (Block &b : f) {
-    if (blocks.count(&b) == 0)
-      topologicalSortImpl(blocks, &b);
+    if (blocks.count(&b) == 0) {
+      llvm::ReversePostOrderTraversal<Block *> traversal(&b);
+      blocks.insert(traversal.begin(), traversal.end());
+    }
   }
   assert(blocks.size() == f.getBlocks().size() && "some blocks are not sorted");
 
@@ -389,6 +407,9 @@ LogicalResult
 ModuleTranslation::convertOmpParallel(Operation &opInst,
                                       llvm::IRBuilder<> &builder) {
   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+  // TODO: support error propagation in OpenMPIRBuilder and use it instead of
+  // relying on captured variables.
+  LogicalResult bodyGenStatus = success();
 
   auto bodyGenCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP,
                        llvm::BasicBlock &continuationIP) {
@@ -396,50 +417,27 @@ ModuleTranslation::convertOmpParallel(Operation &opInst,
 
     llvm::BasicBlock *codeGenIPBB = codeGenIP.getBlock();
     llvm::Instruction *codeGenIPBBTI = codeGenIPBB->getTerminator();
+    ompContinuationIPStack.push_back(&continuationIP);
 
-    builder.SetInsertPoint(codeGenIPBB);
-
-    for (auto &region : opInst.getRegions()) {
-      for (auto &bb : region) {
-        auto *llvmBB = llvm::BasicBlock::Create(
-            llvmContext, "omp.par.region", codeGenIP.getBlock()->getParent());
-        blockMapping[&bb] = llvmBB;
-      }
-
-      // Then, convert blocks one by one in topological order to ensure
-      // defs are converted before uses.
-      llvm::SetVector<Block *> blocks = topologicalSort(region);
-      for (auto indexedBB : llvm::enumerate(blocks)) {
-        Block *bb = indexedBB.value();
-        llvm::BasicBlock *curLLVMBB = blockMapping[bb];
-        if (bb->isEntryBlock())
-          codeGenIPBBTI->setSuccessor(0, curLLVMBB);
-
-        // TODO: Error not returned up the hierarchy
-        if (failed(
-                convertBlock(*bb, /*ignoreArguments=*/indexedBB.index() == 0)))
-          return;
-
-        // If this block has the terminator then add a jump to
-        // continuation bb
-        for (auto &op : *bb) {
-          if (isa<omp::TerminatorOp>(op)) {
-            builder.SetInsertPoint(curLLVMBB);
-            builder.CreateBr(&continuationIP);
-          }
-        }
-      }
-      // Finally, after all blocks have been traversed and values mapped,
-      // connect the PHI nodes to the results of preceding blocks.
-      connectPHINodes(region, valueMapping, blockMapping);
+    // ParallelOp has only `1` region associated with it.
+    auto &region = cast<omp::ParallelOp>(opInst).getRegion();
+    for (auto &bb : region) {
+      auto *llvmBB = llvm::BasicBlock::Create(
+          llvmContext, "omp.par.region", codeGenIP.getBlock()->getParent());
+      blockMapping[&bb] = llvmBB;
     }
+
+    convertOmpOpRegions(region, valueMapping, blockMapping, codeGenIPBBTI,
+                        continuationIP, builder, bodyGenStatus);
+    ompContinuationIPStack.pop_back();
+
   };
 
   // TODO: Perform appropriate actions according to the data-sharing
   // attribute (shared, private, firstprivate, ...) of variables.
   // Currently defaults to shared.
   auto privCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP,
-                    llvm::Value &vPtr,
+                    llvm::Value &, llvm::Value &vPtr,
                     llvm::Value *&replacementValue) -> InsertPointTy {
     replacementValue = &vPtr;
 
@@ -450,14 +448,91 @@ ModuleTranslation::convertOmpParallel(Operation &opInst,
   // called for variables which have destructors/finalizers.
   auto finiCB = [&](InsertPointTy codeGenIP) {};
 
-  // TODO: The various operands of parallel operation are not handled.
-  // Parallel operation is created with some default options for now.
   llvm::Value *ifCond = nullptr;
+  if (auto ifExprVar = cast<omp::ParallelOp>(opInst).if_expr_var())
+    ifCond = valueMapping.lookup(ifExprVar);
   llvm::Value *numThreads = nullptr;
+  if (auto numThreadsVar = cast<omp::ParallelOp>(opInst).num_threads_var())
+    numThreads = valueMapping.lookup(numThreadsVar);
+  llvm::omp::ProcBindKind pbKind = llvm::omp::OMP_PROC_BIND_default;
+  if (auto bind = cast<omp::ParallelOp>(opInst).proc_bind_val())
+    pbKind = llvm::omp::getProcBindKind(bind.getValue());
+  // TODO: Is the Parallel construct cancellable?
   bool isCancellable = false;
-  builder.restoreIP(ompBuilder->CreateParallel(
-      builder, bodyGenCB, privCB, finiCB, ifCond, numThreads,
-      llvm::omp::OMP_PROC_BIND_default, isCancellable));
+  // TODO: Determine the actual alloca insertion point, e.g., the function
+  // entry or the alloca insertion point as provided by the body callback
+  // above.
+  llvm::OpenMPIRBuilder::InsertPointTy allocaIP(builder.saveIP());
+  if (failed(bodyGenStatus))
+    return failure();
+  builder.restoreIP(
+      ompBuilder->createParallel(builder, allocaIP, bodyGenCB, privCB, finiCB,
+                                 ifCond, numThreads, pbKind, isCancellable));
+  return success();
+}
+
+void ModuleTranslation::convertOmpOpRegions(
+    Region &region, DenseMap<Value, llvm::Value *> &valueMapping,
+    DenseMap<Block *, llvm::BasicBlock *> &blockMapping,
+    llvm::Instruction *codeGenIPBBTI, llvm::BasicBlock &continuationIP,
+    llvm::IRBuilder<> &builder, LogicalResult &bodyGenStatus) {
+  // Convert blocks one by one in topological order to ensure
+  // defs are converted before uses.
+  llvm::SetVector<Block *> blocks = topologicalSort(region);
+  for (auto indexedBB : llvm::enumerate(blocks)) {
+    Block *bb = indexedBB.value();
+    llvm::BasicBlock *curLLVMBB = blockMapping[bb];
+    if (bb->isEntryBlock()) {
+      assert(codeGenIPBBTI->getNumSuccessors() == 1 &&
+             "OpenMPIRBuilder provided entry block has multiple successors");
+      assert(codeGenIPBBTI->getSuccessor(0) == &continuationIP &&
+             "ContinuationIP is not the successor of OpenMPIRBuilder "
+             "provided entry block");
+      codeGenIPBBTI->setSuccessor(0, curLLVMBB);
+    }
+
+    if (failed(convertBlock(*bb, /*ignoreArguments=*/indexedBB.index() == 0))) {
+      bodyGenStatus = failure();
+      return;
+    }
+  }
+  // Finally, after all blocks have been traversed and values mapped,
+  // connect the PHI nodes to the results of preceding blocks.
+  connectPHINodes(region, valueMapping, blockMapping, branchMapping);
+}
+
+LogicalResult ModuleTranslation::convertOmpMaster(Operation &opInst,
+                                                  llvm::IRBuilder<> &builder) {
+  using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+  // TODO: support error propagation in OpenMPIRBuilder and use it instead of
+  // relying on captured variables.
+  LogicalResult bodyGenStatus = success();
+
+  auto bodyGenCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP,
+                       llvm::BasicBlock &continuationIP) {
+    llvm::LLVMContext &llvmContext = llvmModule->getContext();
+
+    llvm::BasicBlock *codeGenIPBB = codeGenIP.getBlock();
+    llvm::Instruction *codeGenIPBBTI = codeGenIPBB->getTerminator();
+    ompContinuationIPStack.push_back(&continuationIP);
+
+    // MasterOp has only `1` region associated with it.
+    auto &region = cast<omp::MasterOp>(opInst).getRegion();
+    for (auto &bb : region) {
+      auto *llvmBB = llvm::BasicBlock::Create(
+          llvmContext, "omp.master.region", codeGenIP.getBlock()->getParent());
+      blockMapping[&bb] = llvmBB;
+    }
+    convertOmpOpRegions(region, valueMapping, blockMapping, codeGenIPBBTI,
+                        continuationIP, builder, bodyGenStatus);
+    ompContinuationIPStack.pop_back();
+  };
+
+  // TODO: Perform finalization actions for variables. This has to be
+  // called for variables which have destructors/finalizers.
+  auto finiCB = [&](InsertPointTy codeGenIP) {};
+
+  builder.restoreIP(ompBuilder->createMaster(builder, bodyGenCB, finiCB));
   return success();
 }
 
@@ -472,19 +547,19 @@ ModuleTranslation::convertOmpOperation(Operation &opInst,
   }
   return llvm::TypeSwitch<Operation *, LogicalResult>(&opInst)
       .Case([&](omp::BarrierOp) {
-        ompBuilder->CreateBarrier(builder.saveIP(), llvm::omp::OMPD_barrier);
+        ompBuilder->createBarrier(builder.saveIP(), llvm::omp::OMPD_barrier);
         return success();
       })
       .Case([&](omp::TaskwaitOp) {
-        ompBuilder->CreateTaskwait(builder.saveIP());
+        ompBuilder->createTaskwait(builder.saveIP());
         return success();
       })
       .Case([&](omp::TaskyieldOp) {
-        ompBuilder->CreateTaskyield(builder.saveIP());
+        ompBuilder->createTaskyield(builder.saveIP());
         return success();
       })
       .Case([&](omp::FlushOp) {
-        // No support in Openmp runtime funciton (__kmpc_flush) to accept
+        // No support in Openmp runtime function (__kmpc_flush) to accept
         // the argument list.
         // OpenMP standard states the following:
         //  "An implementation may implement a flush with a list by ignoring
@@ -492,12 +567,16 @@ ModuleTranslation::convertOmpOperation(Operation &opInst,
         //
         // The argument list is discarded so that, flush with a list is treated
         // same as a flush without a list.
-        ompBuilder->CreateFlush(builder.saveIP());
+        ompBuilder->createFlush(builder.saveIP());
         return success();
       })
-      .Case([&](omp::TerminatorOp) { return success(); })
+      .Case([&](omp::TerminatorOp) {
+        builder.CreateBr(ompContinuationIPStack.back());
+        return success();
+      })
       .Case(
           [&](omp::ParallelOp) { return convertOmpParallel(opInst, builder); })
+      .Case([&](omp::MasterOp) { return convertOmpMaster(opInst, builder); })
       .Default([&](Operation *inst) {
         return inst->emitError("unsupported OpenMP operation: ")
                << inst->getName();
@@ -553,6 +632,41 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
     return success(result->getType()->isVoidTy());
   }
 
+  if (auto inlineAsmOp = dyn_cast<LLVM::InlineAsmOp>(opInst)) {
+    // TODO: refactor function type creation which usually occurs in std-LLVM
+    // conversion.
+    SmallVector<LLVM::LLVMType, 8> operandTypes;
+    operandTypes.reserve(inlineAsmOp.operands().size());
+    for (auto t : inlineAsmOp.operands().getTypes())
+      operandTypes.push_back(t.cast<LLVM::LLVMType>());
+
+    LLVM::LLVMType resultType;
+    if (inlineAsmOp.getNumResults() == 0) {
+      resultType = LLVM::LLVMType::getVoidTy(mlirModule->getContext());
+    } else {
+      assert(inlineAsmOp.getNumResults() == 1);
+      resultType = inlineAsmOp.getResultTypes()[0].cast<LLVM::LLVMType>();
+    }
+    auto ft = LLVM::LLVMType::getFunctionTy(resultType, operandTypes,
+                                            /*isVarArg=*/false);
+    llvm::InlineAsm *inlineAsmInst =
+        inlineAsmOp.asm_dialect().hasValue()
+            ? llvm::InlineAsm::get(
+                  static_cast<llvm::FunctionType *>(convertType(ft)),
+                  inlineAsmOp.asm_string(), inlineAsmOp.constraints(),
+                  inlineAsmOp.has_side_effects(), inlineAsmOp.is_align_stack(),
+                  convertAsmDialectToLLVM(*inlineAsmOp.asm_dialect()))
+            : llvm::InlineAsm::get(
+                  static_cast<llvm::FunctionType *>(convertType(ft)),
+                  inlineAsmOp.asm_string(), inlineAsmOp.constraints(),
+                  inlineAsmOp.has_side_effects(), inlineAsmOp.is_align_stack());
+    llvm::Value *result =
+        builder.CreateCall(inlineAsmInst, lookupValues(inlineAsmOp.operands()));
+    if (opInst.getNumResults() != 0)
+      valueMapping[opInst.getResult(0)] = result;
+    return success();
+  }
+
   if (auto invOp = dyn_cast<LLVM::InvokeOp>(opInst)) {
     auto operands = lookupValues(opInst.getOperands());
     ArrayRef<llvm::Value *> operandsRef(operands);
@@ -573,7 +687,7 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
   }
 
   if (auto lpOp = dyn_cast<LLVM::LandingpadOp>(opInst)) {
-    llvm::Type *ty = lpOp.getType().dyn_cast<LLVMType>().getUnderlyingType();
+    llvm::Type *ty = convertType(lpOp.getType().cast<LLVMType>());
     llvm::LandingPadInst *lpi =
         builder.CreateLandingPad(ty, lpOp.getNumOperands());
 
@@ -590,13 +704,58 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
   // Emit branches.  We need to look up the remapped blocks and ignore the block
   // arguments that were transformed into PHI nodes.
   if (auto brOp = dyn_cast<LLVM::BrOp>(opInst)) {
-    builder.CreateBr(blockMapping[brOp.getSuccessor()]);
+    llvm::BranchInst *branch =
+        builder.CreateBr(blockMapping[brOp.getSuccessor()]);
+    branchMapping.try_emplace(&opInst, branch);
     return success();
   }
   if (auto condbrOp = dyn_cast<LLVM::CondBrOp>(opInst)) {
-    builder.CreateCondBr(valueMapping.lookup(condbrOp.getOperand(0)),
-                         blockMapping[condbrOp.getSuccessor(0)],
-                         blockMapping[condbrOp.getSuccessor(1)]);
+    auto weights = condbrOp.branch_weights();
+    llvm::MDNode *branchWeights = nullptr;
+    if (weights) {
+      // Map weight attributes to LLVM metadata.
+      auto trueWeight =
+          weights.getValue().getValue(0).cast<IntegerAttr>().getInt();
+      auto falseWeight =
+          weights.getValue().getValue(1).cast<IntegerAttr>().getInt();
+      branchWeights =
+          llvm::MDBuilder(llvmModule->getContext())
+              .createBranchWeights(static_cast<uint32_t>(trueWeight),
+                                   static_cast<uint32_t>(falseWeight));
+    }
+    llvm::BranchInst *branch = builder.CreateCondBr(
+        valueMapping.lookup(condbrOp.getOperand(0)),
+        blockMapping[condbrOp.getSuccessor(0)],
+        blockMapping[condbrOp.getSuccessor(1)], branchWeights);
+    branchMapping.try_emplace(&opInst, branch);
+    return success();
+  }
+  if (auto switchOp = dyn_cast<LLVM::SwitchOp>(opInst)) {
+    llvm::MDNode *branchWeights = nullptr;
+    if (auto weights = switchOp.branch_weights()) {
+      llvm::SmallVector<uint32_t> weightValues;
+      weightValues.reserve(weights->size());
+      for (llvm::APInt weight : weights->cast<DenseIntElementsAttr>())
+        weightValues.push_back(weight.getLimitedValue());
+      branchWeights = llvm::MDBuilder(llvmModule->getContext())
+                          .createBranchWeights(weightValues);
+    }
+
+    llvm::SwitchInst *switchInst =
+        builder.CreateSwitch(valueMapping[switchOp.value()],
+                             blockMapping[switchOp.defaultDestination()],
+                             switchOp.caseDestinations().size(), branchWeights);
+
+    auto *ty = llvm::cast<llvm::IntegerType>(
+        convertType(switchOp.value().getType().cast<LLVMType>()));
+    for (auto i :
+         llvm::zip(switchOp.case_values()->cast<DenseIntElementsAttr>(),
+                   switchOp.caseDestinations()))
+      switchInst->addCase(
+          llvm::ConstantInt::get(ty, std::get<0>(i).getLimitedValue()),
+          blockMapping[std::get<1>(i)]);
+
+    branchMapping.try_emplace(&opInst, switchInst);
     return success();
   }
 
@@ -617,9 +776,8 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
     return success();
   }
 
-  if (opInst.getDialect() == ompDialect) {
+  if (ompDialect && opInst.getDialect() == ompDialect)
     return convertOmpOperation(opInst, builder);
-  }
 
   return opInst.emitError("unsupported or non-LLVM operation: ")
          << opInst.getName();
@@ -647,7 +805,7 @@ LogicalResult ModuleTranslation::convertBlock(Block &bb, bool ignoreArguments) {
       if (!wrappedType)
         return emitError(bb.front().getLoc(),
                          "block argument does not have an LLVM type");
-      llvm::Type *type = wrappedType.getUnderlyingType();
+      llvm::Type *type = convertType(wrappedType);
       llvm::PHINode *phi = builder.CreatePHI(type, numPredecessors);
       valueMapping[arg] = phi;
     }
@@ -669,11 +827,8 @@ LogicalResult ModuleTranslation::convertBlock(Block &bb, bool ignoreArguments) {
 /// Create named global variables that correspond to llvm.mlir.global
 /// definitions.
 LogicalResult ModuleTranslation::convertGlobals() {
-  // Lock access to the llvm context.
-  llvm::sys::SmartScopedLock<true> scopedLock(
-      llvmDialect->getLLVMContextMutex());
   for (auto op : getModuleBody(mlirModule).getOps<LLVM::GlobalOp>()) {
-    llvm::Type *type = op.getType().getUnderlyingType();
+    llvm::Type *type = convertType(op.getType());
     llvm::Constant *cst = llvm::UndefValue::get(type);
     if (op.getValueOrNull()) {
       // String attributes are treated separately because they cannot appear as
@@ -702,7 +857,7 @@ LogicalResult ModuleTranslation::convertGlobals() {
         ((linkage == llvm::GlobalVariable::ExternalLinkage &&
           isa<llvm::UndefValue>(cst)) ||
          linkage == llvm::GlobalVariable::ExternalWeakLinkage);
-    auto addrSpace = op.addr_space().getLimitedValue();
+    auto addrSpace = op.addr_space();
     auto *var = new llvm::GlobalVariable(
         *llvmModule, type, op.constant(), linkage,
         anyExternalLinkage ? nullptr : cst, op.sym_name(),
@@ -792,10 +947,11 @@ forwardPassthroughAttributes(Location loc, Optional<ArrayAttr> attributes,
 }
 
 LogicalResult ModuleTranslation::convertOneFunction(LLVMFuncOp func) {
-  // Clear the block and value mappings, they are only relevant within one
+  // Clear the block, branch value mappings, they are only relevant within one
   // function.
   blockMapping.clear();
   valueMapping.clear();
+  branchMapping.clear();
   llvm::Function *llvmFunc = functionMapping.lookup(func.getName());
 
   // Translate the debug information for this function.
@@ -808,22 +964,24 @@ LogicalResult ModuleTranslation::convertOneFunction(LLVMFuncOp func) {
     llvm::Argument &llvmArg = std::get<1>(kvp);
     BlockArgument mlirArg = std::get<0>(kvp);
 
-    if (auto attr = func.getArgAttrOfType<BoolAttr>(argIdx, "llvm.noalias")) {
+    if (auto attr = func.getArgAttrOfType<BoolAttr>(
+            argIdx, LLVMDialect::getNoAliasAttrName())) {
       // NB: Attribute already verified to be boolean, so check if we can indeed
       // attach the attribute to this argument, based on its type.
       auto argTy = mlirArg.getType().dyn_cast<LLVM::LLVMType>();
-      if (!argTy.getUnderlyingType()->isPointerTy())
+      if (!argTy.isPointerTy())
         return func.emitError(
             "llvm.noalias attribute attached to LLVM non-pointer argument");
       if (attr.getValue())
         llvmArg.addAttr(llvm::Attribute::AttrKind::NoAlias);
     }
 
-    if (auto attr = func.getArgAttrOfType<IntegerAttr>(argIdx, "llvm.align")) {
+    if (auto attr = func.getArgAttrOfType<IntegerAttr>(
+            argIdx, LLVMDialect::getAlignAttrName())) {
       // NB: Attribute already verified to be int, so check if we can indeed
       // attach the attribute to this argument, based on its type.
       auto argTy = mlirArg.getType().dyn_cast<LLVM::LLVMType>();
-      if (!argTy.getUnderlyingType()->isPointerTy())
+      if (!argTy.isPointerTy())
         return func.emitError(
             "llvm.align attribute attached to LLVM non-pointer argument");
       llvmArg.addAttrs(
@@ -861,7 +1019,7 @@ LogicalResult ModuleTranslation::convertOneFunction(LLVMFuncOp func) {
 
   // Finally, after all blocks have been traversed and values mapped, connect
   // the PHI nodes to the results of preceding blocks.
-  connectPHINodes(func, valueMapping, blockMapping);
+  connectPHINodes(func, valueMapping, blockMapping, branchMapping);
   return success();
 }
 
@@ -873,17 +1031,14 @@ LogicalResult ModuleTranslation::checkSupportedModuleOps(Operation *m) {
 }
 
 LogicalResult ModuleTranslation::convertFunctionSignatures() {
-  // Lock access to the llvm context.
-  llvm::sys::SmartScopedLock<true> scopedLock(
-      llvmDialect->getLLVMContextMutex());
-
   // Declare all functions first because there may be function calls that form a
   // call graph with cycles, or global initializers that reference functions.
   for (auto function : getModuleBody(mlirModule).getOps<LLVMFuncOp>()) {
     llvm::FunctionCallee llvmFuncCst = llvmModule->getOrInsertFunction(
         function.getName(),
-        cast<llvm::FunctionType>(function.getType().getUnderlyingType()));
+        cast<llvm::FunctionType>(convertType(function.getType())));
     llvm::Function *llvmFunc = cast<llvm::Function>(llvmFuncCst.getCallee());
+    llvmFunc->setLinkage(convertLinkageToLLVM(function.linkage()));
     functionMapping[function.getName()] = llvmFunc;
 
     // Forward the pass-through attributes to LLVM.
@@ -896,10 +1051,6 @@ LogicalResult ModuleTranslation::convertFunctionSignatures() {
 }
 
 LogicalResult ModuleTranslation::convertFunctions() {
-  // Lock access to the llvm context.
-  llvm::sys::SmartScopedLock<true> scopedLock(
-      llvmDialect->getLLVMContextMutex());
-
   // Convert functions.
   for (auto function : getModuleBody(mlirModule).getOps<LLVMFuncOp>()) {
     // Ignore external functions.
@@ -911,6 +1062,10 @@ LogicalResult ModuleTranslation::convertFunctions() {
   }
 
   return success();
+}
+
+llvm::Type *ModuleTranslation::convertType(LLVMType type) {
+  return typeTranslator.translateType(type);
 }
 
 /// A helper to look up remapped operands in the value remapping table.`
@@ -925,22 +1080,20 @@ ModuleTranslation::lookupValues(ValueRange values) {
   return remapped;
 }
 
-std::unique_ptr<llvm::Module>
-ModuleTranslation::prepareLLVMModule(Operation *m) {
-  auto *dialect = m->getContext()->getRegisteredDialect<LLVM::LLVMDialect>();
-  assert(dialect && "LLVM dialect must be registered");
-  // Lock the LLVM context as we might create new types here.
-  llvm::sys::SmartScopedLock<true> scopedLock(dialect->getLLVMContextMutex());
-
-  auto llvmModule = llvm::CloneModule(dialect->getLLVMModule());
-  if (!llvmModule)
-    return nullptr;
-
-  llvm::LLVMContext &llvmContext = llvmModule->getContext();
-  llvm::IRBuilder<> builder(llvmContext);
+std::unique_ptr<llvm::Module> ModuleTranslation::prepareLLVMModule(
+    Operation *m, llvm::LLVMContext &llvmContext, StringRef name) {
+  m->getContext()->getOrLoadDialect<LLVM::LLVMDialect>();
+  auto llvmModule = std::make_unique<llvm::Module>(name, llvmContext);
+  if (auto dataLayoutAttr =
+          m->getAttr(LLVM::LLVMDialect::getDataLayoutAttrName()))
+    llvmModule->setDataLayout(dataLayoutAttr.cast<StringAttr>().getValue());
+  if (auto targetTripleAttr =
+          m->getAttr(LLVM::LLVMDialect::getTargetTripleAttrName()))
+    llvmModule->setTargetTriple(targetTripleAttr.cast<StringAttr>().getValue());
 
   // Inject declarations for `malloc` and `free` functions that can be used in
   // memref allocation/deallocation coming from standard ops lowering.
+  llvm::IRBuilder<> builder(llvmContext);
   llvmModule->getOrInsertFunction("malloc", builder.getInt8PtrTy(),
                                   builder.getInt64Ty());
   llvmModule->getOrInsertFunction("free", builder.getVoidTy(),
